@@ -4674,7 +4674,7 @@ RRateLimiter 接口的实现类几乎都在 RedissonRateLimiter 上，我们看�
 就是前面 `setRate` 设置的 hash key。按照之前限流器命名“LIMITER_NAME”，这个 redis key 的名字就是 `LIMITER_NAME`。一共有3个值：
 
 1. `rate`：代表速率
-2. `interval`：代表多少时间内产生的令牌
+2. `interval`：代表多少时间内产生的令牌，生成令牌的时间区间
 3. `type`：代表单机还是集群
 
 > **2. key 2：ZSET 结构**
@@ -4687,8 +4687,6 @@ ZSET 记录获取令牌的时间戳，用于时间对比，redis key 的名字�
 > **3. key 3： String 结构**
 
 记录的是当前令牌桶中剩余的令牌数。redis key 的名字是 `{LIMITER_NAME}:value`。
-
-
 
 RRateLimiter在初始化限流器时，会调用`trySetRate()`方法，直接来看它的源码：
 
@@ -5149,7 +5147,7 @@ List<ClockInRecord> curChannelRecords = originRecordService.batchHandleOriginRec
 
 在 `handleChannelRecords` 方法中使用了 Redisson 提供的分布式锁这个方法的主要目的是处理批量同步的渠道打卡数据。在处理过程中，它需要访问和更新一些共享的数据结构，比如 `employeeUniqkeyChannelRecordsMap`，由于此方法可能会被多个线程同时调用，而且会涉及到共享数据的读写操作，因此需要使用分布式锁来确保线程安全性。而**handleChannelSyncTaskData 方法**并不直接涉及到共享数据的读写操作，而是根据输入的数据进行一些逻辑处理，并更新任务状态。由于其操作不涉及到共享数据的并发读写，因此不需要加锁。那么我们接下来就来看看Redisson分布式锁的底层原理！
 
-### 分布式锁 Redisson-Lock
+### 分布式锁 RedissonLock
 
 使用redisson实现分布式锁的代码十分简单，如下所示：
 
@@ -5423,39 +5421,183 @@ private void scheduleExpirationRenewal(long threadId) {
 
 ![f2a17e07363807624568a75d21fd396](https://cdn.jsdelivr.net/gh/amonstercat/PicGo@master/202403292008574.png)
 
-**当leaseTime == -1时，才会启动看门狗机制**，它的主要步骤如下：
+**当leaseTime == -1时，才会启动看门狗机制（`scheduleExpirationRenewal(threadId)`）**，它的主要步骤如下：
 
 - 在获取锁的时候，不能指定leaseTime或者只能将leaseTime设置为-1，这样才能开启看门狗机制。
-- 在tryLockInnerAsync方法里尝试获取锁，如果获取锁成功调用scheduleExpirationRenewal执行看门狗机制
-- 在scheduleExpirationRenewal中比较重要的方法就是renewExpiration，当线程第一次获取到锁（也就是不是重入的情况），那么就会调用renewExpiration方法开启看门狗机制。
-- 在renewExpiration会为当前锁添加一个延迟任务task，这个延迟任务会在10s后执行，执行的任务就是将锁的有效期刷新为30s（这是看门狗机制的默认锁释放时间）
-- 并且在任务最后还会继续递归调用renewExpiration。
+- 在`tryLockInnerAsync`方法里尝试获取锁，如果获取锁成功调用`scheduleExpirationRenewal`执行看门狗机制
+- 在`scheduleExpirationRenewal`中比较重要的方法就是`renewExpiration`，当线程第一次获取到锁（也就是不是重入的情况），那么就会调用`renewExpiration`方法开启看门狗机制。
+- 在`renewExpiration`会为当前锁添加一个延迟任务task，这个延迟任务会在10s后执行，执行的任务就是将锁的有效期刷新为30s（这是看门狗机制的默认锁释放时间）
+- 并且在任务最后还会继续递归调用`renewExpiration`。
 
-总的流程就是，首先获取到锁（这个锁30s后自动释放），然后对锁设置一个延迟任务（10s后执行），延迟任务给锁的释放时间刷新为30s，并且还为锁再设置一个相同的延迟任务（10s后执行），这样就达到了如果一直不释放锁（程序没有执行完）的话，看门狗机制会每10s将锁的自动释放时间刷新为30s。
+再来看看`scheduleExpirationRenewal` 方法的实现，其中`ExpirationEntry` 对象存放了与锁的到期时间和线程标识相关的信息，`EXPIRATION_RENEWAL_MAP` 是一个 `ConcurrentMap` 类型的静态变量，用于存储锁的到期时间的映射关系。具体来说，它的键是一个字符串，通常是用于唯一标识某个锁的名称或标识符，而值是 `ExpirationEntry` 对象，用于管理该锁的到期时间和相关线程标识：
 
-而当程序出现异常，那么看门狗机制就不会继续递归调用renewExpiration，这样锁会在30s后自动释放。或者，在程序主动释放锁后，流程如下：
+```java
+private void scheduleExpirationRenewal(long threadId) {
+    ExpirationEntry entry = new ExpirationEntry();
+    /*
+    *使用 putIfAbsent 方法将该 ExpirationEntry 对象放入 EXPIRATION_RENEWAL_MAP 中。
+    如果已经存在相同键名的 ExpirationEntry，则将当前 threadId 添加到现有的 ExpirationEntry 中。
+    */
+    ExpirationEntry oldEntry = EXPIRATION_RENEWAL_MAP.putIfAbsent(getEntryName(), entry);
+    if (oldEntry != null) {
+        oldEntry.addThreadId(threadId);
+    } 
+    //如果 putIfAbsent 返回的旧条目为空（即之前不存在相同键名的 ExpirationEntry），则将当前 threadId 添加到新创建的 ExpirationEntry 中，并调用 renewExpiration 方法。
+    else{
+        entry.addThreadId(threadId);
+        // 第一次获得锁,执行延期操作
+        renewExpiration();
+    }
+}
+```
+
+`putIfAbsent` 是一个常见的并发哈希映射（ConcurrentHashMap）中的方法，它尝试将指定的键-值对放入映射中，但只有在该键尚未存在时才执行放入操作。如果已经存在具有相同键的映射项，则不会执行放入操作，并且该方法会返回已经存在的值。在多线程环境下，`putIfAbsent` 方法是原子操作的，因此可以确保线程安全性，避免出现竞态条件。
+
+`ConcurrentHashMap` 使用 CAS 来保证 `putIfAbsent` 方法的原子性。当多个线程同时调用 `putIfAbsent` 方法时，它们会尝试获取哈希桶中相应键的锁，然后使用 CAS 操作来确保只有一个线程成功地插入新的键-值对。其他线程会根据 CAS 操作的结果来确定是否插入成功，如果失败则重试或者返回失败。
+
+
+
+进入`renewExpiration()`方法后：
+
+```java
+private void renewExpiration() {
+    ExpirationEntry ee = EXPIRATION_RENEWAL_MAP.get(getEntryName());
+    //如果缓存不存在，那不再锁续期
+    if (ee == null) {
+        return;
+    }
+    
+    Timeout task = commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
+        @Override
+        public void run(Timeout timeout) throws Exception {
+            ExpirationEntry ent = EXPIRATION_RENEWAL_MAP.get(getEntryName());
+            if (ent == null) {
+                return;
+            }
+            Long threadId = ent.getFirstThreadId();
+            if (threadId == null) {
+                return;
+            }
+            
+            //执行lua 进行续期
+            RFuture<Boolean> future = renewExpirationAsync(threadId);
+            future.onComplete((res, e) -> {
+                if (e != null) {
+                    log.error("Can't update lock " + getName() + " expiration", e);
+                    return;
+                }
+                
+                if (res) {
+                    //延期成功，继续循环操作
+                    renewExpiration();
+                }
+            });
+        }
+        //每隔internalLockLeaseTime/3=10秒检查一次
+    }, internalLockLeaseTime / 3, TimeUnit.MILLISECONDS);
+    
+    ee.setTimeout(task);
+}
+
+```
+
+具体逻辑如下：
+
+1. 首先，根据锁的名称从 `EXPIRATION_RENEWAL_MAP` 中获取与之对应的 `ExpirationEntry` 对象。
+2. 如果没有找到对应的 `ExpirationEntry`，说明该锁已经被释放，直接返回。
+3. 创建一个新的定时任务，任务内容是在锁的到期时间的三分之一时长后执行。
+4. 在任务的 `run` 方法中，再次获取与锁名称对应的 `ExpirationEntry` 对象，以确保在任务执行前锁未被释放。
+5. 获取 `ExpirationEntry` 中的第一个线程标识，用于执行锁的续期操作。
+6. 调用 `renewExpirationAsync` 方法异步执行锁的续期操作。
+7. 在续期操作完成后的回调中，检查是否续期成功。如果成功，则继续执行续期逻辑，即调用 `renewExpiration` 方法，否则停止续期操作。
+
+
+
+锁续期的lua脚本实现如下:
+
+```lua
+//lua脚本 执行包装好的lua脚本进行key续期
+protected RFuture<Boolean> renewExpirationAsync(long threadId) {
+    return evalWriteAsync(getName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+            "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
+                    "redis.call('pexpire', KEYS[1], ARGV[1]); " +
+                    "return 1; " +
+                    "end; " +
+                    "return 0;",
+            Collections.singletonList(getName()),
+            internalLockLeaseTime, getLockName(threadId));
+}
+```
+
+上述源码读过来我们可以记住几个关键情报：
+
+1. watch dog 在当前节点存活时每10s给分布式锁的key续期 30s；
+2. watch dog 机制启动，且代码中没有释放锁操作时，watch dog 会不断的给锁续期；
+3. 如果程序释放锁操作时因为异常没有被执行，那么锁无法被释放，**所以释放锁操作一定要放到 finally {} 中吗 ???** 
+
+**看到3的时候，可能会有人有疑问，如果释放锁操作本身异常了，watch dog 还会不停的续期吗？后面我们会看一下释放锁的源码来找答案。**
+
+>  为什么是30s?  直接看下列代码
+>
+> 在执行`TimerTask()`时会传入`internalLockLeaseTime`，该参数默认值就是30
+>
+> ![image-20240330125514333](https://cdn.jsdelivr.net/gh/amonstercat/PicGo@master/202403301255433.png)
+>
+> ![image-20240330125552348](https://cdn.jsdelivr.net/gh/amonstercat/PicGo@master/202403301255437.png)
+
+而当程序出现异常时，那么看门狗机制就不会继续递归调用`renewExpiration()`，这样锁会在30s后自动释放。或者在程序主动释放锁后锁也会在30s后自动释放，流程如下：
 
 - 将锁对应的线程ID移除
 - 接着从锁中获取出延迟任务，将延迟任务取消
-- 在将这把锁从EXPIRATION_RENEWAL_MAP中移除。
+- 再将这把锁从EXPIRATION_RENEWAL_MAP中移除。
   
+
+为什么是这样? 直接看核心代码
+
+```java
+ public void run(Timeout timeout) throws Exception {
+            ExpirationEntry ent = EXPIRATION_RENEWAL_MAP.get(getEntryName());
+            if (ent == null) {
+                return;
+            }
+            Long threadId = ent.getFirstThreadId();
+            if (threadId == null) {
+                return;
+            }
+            //省略
+            
+}
+```
+
+这段代码是一个 `TimerTask` 对象的 `run` 方法，当定时任务触发时会执行这段代码。让我来解释一下这段代码的逻辑：
+
+1. 首先，通过 `getEntryName()` 方法获取到当前锁的名称，然后从 `EXPIRATION_RENEWAL_MAP` 中获取与之对应的 `ExpirationEntry` 对象。
+2. 如果没有找到对应的 `ExpirationEntry` 对象（即 `ent == null`），说明该锁已经被释放，或者在定时任务触发之前已经被移除，此时直接返回，不再执行后续操作。
+3. 如果找到了对应的 `ExpirationEntry` 对象，继续执行后续操作。
+4. 通过 `ent.getFirstThreadId()` 方法获取到存储在 `ExpirationEntry` 对象中的第一个线程标识。
+5. 如果线程标识为 `null`，说明该 `ExpirationEntry` 对象中没有存储任何线程标识，可能是由于在锁释放前没有调用 `addThreadId` 方法添加线程标识，或者在执行续期操作之前已经将所有线程标识移除。此时直接返回，不再执行后续操作。
+
+综上所述，这段代码的主要作用是在定时任务触发时，从 `EXPIRATION_RENEWAL_MAP` 中获取当前锁的 `ExpirationEntry` 对象，并检查其中是否存储了有效的线程标识。如果存在有效的线程标识，则可以继续执行后续锁续期操作；否则直接返回，不再执行续期操作。
+
+
 
 
 
 #### 解锁 unlock
 
-再来看看解锁的流程，锁一般在finally代码块里执行unlock方法，核心方法是unlockAsync，其源码如下：
+再来看看解锁的流程，锁一般在`finally`代码块里执行`unlock`方法，核心方法是`unlockAsync`，其源码如下：
 
 ```java
+// 进入 unlockAsync(Thread.currentThread().getId()) 方法 入参是当前线程的id	
 @Override
 public RFuture<Void> unlockAsync(long threadId) {
     RPromise<Void> result = new RedissonPromise<Void>();
-    // 释放锁
+    // 释放锁 执行lua脚本 删除key
     RFuture<Boolean> future = unlockInnerAsync(threadId);
  
     future.onComplete((opStatus, e) -> {
         if (e != null) {
-            // 释放异常，取消锁续期任务
+           // 无论执行lua脚本是否成功 执行cancelExpirationRenewal(threadId) 方法来删除EXPIRATION_RENEWAL_MAP中的缓存
             cancelExpirationRenewal(threadId);
             result.tryFailure(e);
             return;
@@ -5477,6 +5619,7 @@ public RFuture<Void> unlockAsync(long threadId) {
     return result;
 }
  
+
 protected RFuture<Boolean> unlockInnerAsync(long threadId) {
     //keys[1]]为 Arrays.<Object>asList(getName(), getChannelName())的第一个元素，即锁名
     //keys[2]为Arrays.<Object>asList(getName(), getChannelName())的第二个元素，为锁释放通知的通道，格式为：redisson_lock__channel:{lockName}
@@ -5510,13 +5653,445 @@ protected RFuture<Boolean> unlockInnerAsync(long threadId) {
 }
 ```
 
+取消锁续期的核心操作`cancelExpirationRenewal()`:
+
+```java
+    /**
+ * 取消锁的续期操作
+ * @param threadId 要取消的线程标识，如果为 null，则取消所有线程的续期操作
+ */
+protected void cancelExpirationRenewal(Long threadId) {
+    // 从 EXPIRATION_RENEWAL_MAP 中获取与当前锁名称对应的 ExpirationEntry 对象
+    ExpirationEntry task = EXPIRATION_RENEWAL_MAP.get(getEntryName());
+    if (task == null) {
+        // 如果不存在对应的 ExpirationEntry 对象，则直接返回，无需取消续期操作
+        return;
+    }
+    
+    // 如果 threadId 不为 null，则从 ExpirationEntry 中移除指定的线程标识
+    if (threadId != null) {
+        task.removeThreadId(threadId);
+    }
+
+    // 如果 threadId 为 null，或者 ExpirationEntry 中已经没有线程标识了，则取消续期操作
+    if (threadId == null || task.hasNoThreads()) {
+        // 获取 ExpirationEntry 中存储的定时任务，并取消该任务
+        Timeout timeout = task.getTimeout();
+        if (timeout != null) {
+            timeout.cancel();
+        }
+        // 从 EXPIRATION_RENEWAL_MAP 中移除当前锁的记录
+        EXPIRATION_RENEWAL_MAP.remove(getEntryName());
+    }
+}
+```
+
+
+
+
+
+释放锁的操作中 有一步操作是从 `EXPIRATION_RENEWAL_MAP` 中获取 `ExpirationEntry` 对象，然后将其`remove`，结合watch dog中的续期前的判断：
+
+![image-20240330130742472](https://cdn.jsdelivr.net/gh/amonstercat/PicGo@master/202403301307590.png)
+
+可以得出结论：如果释放锁操作本身异常了，watch dog 还会不停的续期吗？不会，因为无论释放锁操作是否成功，`EXPIRATION_RENEWAL_MAP`中的目标 `ExpirationEntry` 对象已经被移除了 或者说该 `ExpirationEntry` 对象中没有存储任何线程标识，无论是哪种情况，watch dog 机制通过判断后都不会继续给锁续期了。
+
+
+
+
+
+
+
 流程图如下：
 
 ![在这里插入图片描述](https://cdn.jsdelivr.net/gh/amonstercat/PicGo@master/202403291956972.png)
 
 
 
+### 红锁 RedLock
+
+单实例加锁肯定不是很可靠吧，加锁成功之后，结果 Redis 服务宕机了，这不就凉凉~ 这时候会提出来将 Redis 主从部署。即使是主从，也是存在巧合的！主从结构中存在明显的竞态：
+
+1. 客户端 A 从 master 获取到锁
+2. 在 master 将锁同步到 slave 之前，master 宕掉了。
+3. slave 节点被晋级为 master 节点
+4. 客户端 B 取得了同一个资源被客户端 A 已经获取到的另外一个锁。**安全失效！**
+
+这时候 Redis 作者提出了 RedLock 的概念：
+
+![img](https://cdn.jsdelivr.net/gh/amonstercat/PicGo@master/202403301447472.png)
+
+总结一下就是对集群的每个节点进行加锁，如果大多数（N/2+1）加锁成功了，则认为获取锁成功。
+
+那实际解决问题了么？
+
+推荐大家阅读两篇文章：
+
+- Martin Kleppmann：[How to do distributed locking](https://link.segmentfault.com/?enc=Ea3VB1Q6SucbD6btS7JHIQ%3D%3D.rmw0OD8IdDAyR2vQQ8WpJFYejKKNzTtjRrbj4RqT02%2FFz0G7u%2B7qu71S6P%2BedinaSYKM%2BhT2U1L%2BmqEVzg%2Fb%2FVP%2FmhVMeEcxLiRDQ1iWHYo%3D)
+- Salvatore（Redis 作者）：[Is Redlock safe?](https://link.segmentfault.com/?enc=encFFusLoE71m9NxrLX8nA%3D%3D.L%2FmuH3M6zlWDP9voiIeItbKylZ%2FOf2fkv1bfKP9j3gM%3D)
+
+最终，两方各持己见，没有得出结论。
+
+鉴于本文主要是分析 Redisson 的 RedLock，就不做额外赘述，感兴趣的小伙伴可以自己阅读。
+
+这里会简要分析一下 Redisson 中 RedLock 的源码，然后会介绍为什么文章开头不建议大家使用 Redisson 的 RedLock。
+
+```java
+public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) throws InterruptedException {
+    long newLeaseTime = -1;
+    if (leaseTime != -1) {
+        newLeaseTime = unit.toMillis(waitTime)*2;
+    }
+    
+    long time = System.currentTimeMillis();
+    long remainTime = -1;
+    if (waitTime != -1) {
+        remainTime = unit.toMillis(waitTime);
+    }
+    long lockWaitTime = calcLockWaitTime(remainTime);
+    /**
+     * 1\. 允许加锁失败节点个数限制（N-(N/2+1)）
+     */
+    int failedLocksLimit = failedLocksLimit();
+    /**
+     * 2\. 遍历所有节点通过EVAL命令执行lua加锁
+     */
+    List<RLock> acquiredLocks = new ArrayList<>(locks.size());
+    for (ListIterator<RLock> iterator = locks.listIterator(); iterator.hasNext();) {
+        RLock lock = iterator.next();
+        boolean lockAcquired;
+        /**
+         *  3.对节点尝试加锁
+         */
+        try {
+            if (waitTime == -1 && leaseTime == -1) {
+                lockAcquired = lock.tryLock();
+            } else {
+                long awaitTime = Math.min(lockWaitTime, remainTime);
+                lockAcquired = lock.tryLock(awaitTime, newLeaseTime, TimeUnit.MILLISECONDS);
+            }
+        } catch (RedisResponseTimeoutException e) {
+            // 如果抛出这类异常，为了防止加锁成功，但是响应失败，需要解锁所有节点
+            unlockInner(Arrays.asList(lock));
+            lockAcquired = false;
+        } catch (Exception e) {
+            // 抛出异常表示获取锁失败
+            lockAcquired = false;
+        }
+        
+        if (lockAcquired) {
+            /**
+             *4\. 如果获取到锁则添加到已获取锁集合中
+             */
+            acquiredLocks.add(lock);
+        } else {
+            /**
+             * 5\. 计算已经申请锁失败的节点是否已经到达 允许加锁失败节点个数限制 （N-(N/2+1)）
+             * 如果已经到达， 就认定最终申请锁失败，则没有必要继续从后面的节点申请了
+             * 因为 Redlock 算法要求至少N/2+1 个节点都加锁成功，才算最终的锁申请成功
+             */
+            if (locks.size() - acquiredLocks.size() == failedLocksLimit()) {
+                break;
+            }
+
+            if (failedLocksLimit == 0) {
+                unlockInner(acquiredLocks);
+                if (waitTime == -1 && leaseTime == -1) {
+                    return false;
+                }
+                failedLocksLimit = failedLocksLimit();
+                acquiredLocks.clear();
+                // reset iterator
+                while (iterator.hasPrevious()) {
+                    iterator.previous();
+                }
+            } else {
+                failedLocksLimit--;
+            }
+        }
+
+        /**
+         * 6.计算 目前从各个节点获取锁已经消耗的总时间，如果已经等于最大等待时间，则认定最终申请锁失败，返回false
+         */
+        if (remainTime != -1) {
+            remainTime -= System.currentTimeMillis() - time;
+            time = System.currentTimeMillis();
+            if (remainTime <= 0) {
+                unlockInner(acquiredLocks);
+                return false;
+            }
+        }
+    }
+
+    if (leaseTime != -1) {
+        List<RFuture<Boolean>> futures = new ArrayList<>(acquiredLocks.size());
+        for (RLock rLock : acquiredLocks) {
+            RFuture<Boolean> future = ((RedissonLock) rLock).expireAsync(unit.toMillis(leaseTime), TimeUnit.MILLISECONDS);
+            futures.add(future);
+        }
+        
+        for (RFuture<Boolean> rFuture : futures) {
+            rFuture.syncUninterruptibly();
+        }
+    }
+
+    /**
+     * 7.如果逻辑正常执行完则认为最终申请锁成功，返回true
+     */
+    return true;
+}
+```
+
+
+
+**红锁的问题在哪里 :grey_question::grey_question:  **
+
+**Redlock** 有一个隐含条件是所有的主机时间都是正确的，如果时间不正确就会出问题，例如
+
+1. 客户端 1 获取到节点 A、B、C 上的锁
+2. 节点 C 上的时钟「向前跳跃」，导致锁到期
+3. 客户端 2 获取节点 C、D、E 上的锁
+4. 客户端 1 和 2 现在都相信它们持有了锁（冲突）
+
+**Martin** 认为 **Redlock** 必须「强依赖」多个节点的时钟是保持同步的，一旦有节点时钟发生错误，那这个算法模型就失效了。而机器的时钟发生错误，是很有可能发生的，比如：
+
+- 系统管理员「手动修改」了机器时钟
+- 机器时钟在同步 NTP 时间时，发生了大的「跳跃」
+
+总之，**Martin** 认为，**Redlock** 的算法是建立在「同步模型」基础上的，有大量资料研究表明，同步模型的假设，在分布式系统中是有问题的。在混乱的分布式系统的中，你不能假设系统时钟就是对的，所以，你必须非常小心你的假设。
+
+相对应的，**Martin** 提出一种被叫作 **fecing token** 的方案，保证分布式锁的正确性。(这里感叹一句，大神就是大神，不光能发现、提出问题，还能给出解决方案)
+
+这个模型流程如下：
+
+1. 客户端在获取锁时，锁服务可以提供一个「递增」的 token
+2. 客户端拿着这个 token 去操作共享资源
+3. **共享资源可以根据 token 拒绝「后来者」的请求**
+
+![Using fencing tokens to make resource access safe](https://cdn.jsdelivr.net/gh/amonstercat/PicGo@master/202403301506367.png)
+
+这样一来，无论 **NPC** 哪种异常情况发生，都可以保证分布式锁的安全性，因为它是建立在「异步模型」上的。
+
+而 **Redlock** 无法提供类似 **fecing token** 的方案，所以它无法保证安全性。
+
+ Martin 的结论**：**
+
+1. **Redlock** 不伦不类：对于偏好效率来讲，**Redlock** 比较重，没必要这么做，而对于偏好正确性来说，**Redlock** 是不够安全的。
+2. 时钟假设不合理：该算法对系统时钟做出了危险的假设（假设多个节点机器时钟都是一致的），如果不满足这些假设，锁就会失效。
+3. 无法保证正确性：**Redlock** 不能提供类似 **fencing token** 的方案，所以解决不了正确性的问题。为了正确性，请使用有「共识系统」的软件，例如 **Zookeeper**。
+
+以上就是 Martin 反对使用 Redlock 的观点，有理有据。接下来我们来看 **Redis** 作者 **Antirez** 是如何反驳的。
+
+首先，Redis 作者一眼就看穿了对方提出的最为核心的问题：**时钟问题。**
+
+> 为什么 **Redis** 作者优先解释时钟问题？因为在后面的反驳过程中，需要依赖这个基础做进一步解释。
+
+**Redis** 作者表示，**Redlock** 并不需要完全一致的时钟，只需要大体一致就可以了，允许有「误差」，只要误差不要超过锁的租期即可，这种对于时钟的精度要求并不是很高，而且这也符合现实环境。
+
+对于对方提到的「时钟修改」问题，Redis 作者反驳到：
+
+- 手动修改时钟：不要这么做就好了，否则你直接修改 Raft 日志，那 Raft 也会无法工作...
+- 时钟跳跃：通过「恰当的运维」，保证机器时钟不会大幅度跳跃（每次通过微小的调整来完成），实际上这是可以做到的
+
+
+
+随后**Redis** 作者对于对方提出的，网络延迟、进程暂停可能导致 **Redlock** 失效的问题，也做了反驳
+
+我们重新回顾一下，**Martin** 提出的问题假设：
+
+1. 客户端 1 请求锁定节点 A、B、C、D、E
+1. 客户端 1 的拿到锁后，进入进程暂停（时间比较久）
+1. 所有 Redis 节点上的锁都过期了
+1. 客户端 2 获取到了 A、B、C、D、E 上的锁
+1. 客户端 1 GC 结束，认为成功获取锁
+1. 客户端 2 也认为获取到了锁，发生「冲突」
+
+**Redis** 作者反驳到，这个假设其实是有问题的，**Redlock** 是可以保证锁安全的。还记得前面介绍 **Redlock** 流程的那 5 步吗？让我们来复习一下。
+
+1. 客户端先获取「当前时间戳 T1」
+2. 客户端依次向这 5 个 **Redis** 实例发起加锁请求（用前面讲到的 SET 命令），并设置超时时间（毫秒级），如果某一个实例加锁失败（包括网络超时、锁被其它人持有等各种异常情况），就立即向下一个 **Redis** 实例申请加锁
+3. 如果客户端从 >=3 个（大多数）以上 **Redis** 实例加锁成功，则再次获取「当前时间戳 T2」，如果锁的租期 > T2 - T1  ，此时，认为客户端加锁成功，否则认为加锁失败
+4. 加锁成功，去操作共享资源
+5. 加锁失败或操作结束，向「全部节点」发起释放锁请求（前面讲到的 Lua 脚本释放锁）
+
+**注意，重点是 1-3，在步骤 3，加锁成功后为什么要重新获取「当前时间戳 T2」？还用 T2 - T1 的时间，与锁的过期时间做比较？**
+
+**Redis** 作者强调：如果在 1-3 发生了网络延迟、进程暂停等耗时长的异常情况，那在第 3 步 T2 - T1，是可以检测出来的，如果超出了锁设置的过期时间，那这时就认为加锁会失败，之后释放所有节点的锁就好了！
+
+**Redis** 作者继续论述，如果对方认为，发生网络延迟、进程暂停是在步骤 3 之后，也就是客户端确认拿到了锁，去操作共享资源的途中发生了问题，导致锁失效，那这不止是 **Redlock** 的问题，任何其它锁服务例如 **Zookeeper**，都有类似的问题，这不在讨论范畴内。
+
+
+
+**Redis** 作者对于对方提出的 **fecing token** 机制，也提出了质疑，主要分为 2 个问题
+
+第一，这个方案必须要求要操作的「共享资源服务器」有拒绝「旧 token」的能力。
+
+假设共享资源服务器是 **MySQL**，我们要操作 **MySQL**，从锁服务拿到一个递增数字的 **token**，然后客户端要带着这个 **token** 去改 **MySQL** 的某一行，这就需要利用 **MySQL** 的「事物隔离性」来做。
+
+```sql
+// 两个客户端必须利用事物和隔离性达到目的
+// 注意 token 的判断条件
+UPDATE table T SET val = $new_val WHERE id = $id AND current_token < $token
+```
+
+但如果操作的不是 **MySQL** 而是向磁盘上写一个文件，或发起一个 **HTTP** 请求，那这个方案就无能为力了，这对要操作的资源服务器，提出了更高的要求。
+
+**再者，既然资源服务器都有了「互斥」能力，那还要分布式锁干什么？**
+
+所以，Redis 作者认为这个方案是站不住脚的。
+
+第二，退一步讲，即使 **Redlock** 没有提供 **fecing token** 的能力，但 **Redlock** 已经提供了随机值（就是之前讲的 UUID），利用这个随机值，也可以达到与 **fecing token** 同样的效果。
+
+1. 客户端使用 Redlock 拿到锁
+2. 客户端在操作共享资源之前，先把这个锁的 VALUE，在要操作的共享资源上做标记
+3. 客户端处理业务逻辑，最后，在修改共享资源时，判断这个标记是否与之前一样，一样才修改（类似 CAS 的思路）
+
+还是以 MySQL 为例,这个实现如下
+
+1. 客户端使用 Redlock 拿到锁
+2. 客户端要修改 MySQL 表中的某一行数据之前，先把锁的 VALUE 更新到这一行的某个字段中（这里假设为 current_token 字段)
+3. 客户端处理业务逻辑
+4. 客户端修改 MySQL 的这一行数据，把 VALUE 当做 WHERE 条件，再修改
+
+对于上述通过 Redlock “实现” fecing token 的设计，网友提出了一个问题：两个客户端通过这种方案，先「标记」再「检查 + 修改」共享资源，那这两个客户端的操作顺序无法保证啊？而用 **Martin** 提到的 **fecing token**，因为这个 **token** 是单调递增的数字，资源服务器可以拒绝小的 **token** 请求，保证了操作的「顺序性」！
+
+**Redis** 作者对这问题做了不同的解释,我觉得非常有意思，他认为：**分布式锁的本质，是为了「互斥」，只要能保证两个客户端在并发时，一个成功，一个失败就好了，不需要关心「顺序性」**。
+
+> 前面 Martin 的质疑中，一直很关心这个顺序性问题，但 Redis 的作者的看法却不同。
+
+综上，**Redis** 作者的结论：
+
+1. 作者同意对方关于「时钟跳跃」对 **Redlock** 的影响，但认为时钟跳跃是可以避免的，取决于基础设施和运维。
+2. **Redlock** 在设计时，充分考虑了 **NPC** 问题，在 **Redlock** 步骤 3 之前出现 **NPC**，可以保证锁的正确性，但在步骤 3 之后发生 **NPC**，不止是 **Redlock** 有问题，其它分布式锁服务同样也有问题，所以不在讨论范畴内。
+
+
+
+
+
 
 
 ### 整长型累加器（LongAdder）
+
+`AtomicLong` 从Java8开始针对x86平台进行了优化，使用XADD替换了CAS操作，我们知道JUC下面提供的原子类都是基于Unsafe类实现的，并由Unsafe来提供CAS的能力。CAS (compare-and-swap)本质上是由现代CPU在硬件级实现的原子指令，允许进行无阻塞，多线程的数据操作同时兼顾了安全性以及效率。大部分情况下,CAS都能够提供不错的性能，但是在高竞争的情况下开销可能会成倍增长，直接看下列代码：
+
+```java
+public class AtomicLong {
+public final long incrementAndGet() {
+        return unsafe.getAndAddLong(this, valueOffset, 1L) + 1L;
+    }
+}
+
+public final class Unsafe {
+public final long getAndAddLong(Object var1, long var2, long var4) {
+        long var6;
+        do {
+            var6 = this.getLongVolatile(var1, var2);
+        } while(!this.compareAndSwapLong(var1, var2, var6, var6 + var4));
+        return var6;
+    }
+}
+```
+
+`　getAndAddLong`方法会以volatile的语义去读需要自增的域的最新值，然后通过CAS去尝试更新，正常情况下会直接成功后返回，但是在高并发下可能会同时有很多线程同时尝试这个过程，也就是说线程A读到的最新值可能实际已经过期了，因此需要在while循环中不断的重试，造成很多不必要的开销。而xadd的相对来说会更高效一点，伪码如下，最重要的是下面这段代码是原子的，也就是说其他线程不能打断它的执行或者看到中间值，这条指令是在硬件级直接支持的：
+
+```
+function FetchAndAdd(address location, int inc) {
+    int value := *location
+    *location := value + inc
+    return value
+}
+```
+
+`LongAdder`是JDK8添加到JUC中的。它是一个线程安全的、比`Atomic`*系工具性能更好的"计数器"。然而高并发场景下，N 多线程同时去操作一个变量会造成大量线程CAS失败，然后处于自旋状态，导致严重浪费CPU资源，降低了并发性。既然`AtomicLong`性能问题是由于过多线程同时去竞争同一个变量的更新而降低的，那么如果把一个变量分解为多个变量，让同样多的线程去竞争多个资源。
+
+LongAdder则是内部维护一个Cells数组，每个Cell里面有一个初始值为0的long型变量，在同等并发量的情况下，争夺单个变量的线程会减少，这是变相的减少了争夺共享资源的并发量，另外多个线程在争夺同一个原子变量时候，如果失败并不是自旋CAS重试，而是尝试获取其他原子变量的锁，最后当获取当前值时候是把所有变量的值累加后再加上base的值返回的。
+
+LongAdder维护了要给延迟初始化的原子性更新数组和一个基值变量base数组的大小保持是2的N次方大小，数组表的下标使用每个线程的hashcode值的掩码表示，数组里面的变量实体是Cell类型。
+
+Cell 类型是Atomic的一个改进，用来减少缓存的争用，对于大多数原子操作字节填充是浪费的，因为原子操作都是无规律的分散在内存中进行的，多个原子性操作彼此之间是没有接触的，但是原子性数组元素彼此相邻存放将能经常共享缓存行，也就是伪共享。所以这在性能上是一个提升。另外由于Cells占用内存是相对比较大的，所以一开始并不创建，而是在需要时候再创建，也就是惰性加载，当一开始没有空间时候，所有的更新都是操作base变量。
+
+LongAdder的性能比XADD还要好很多，首先它有一个基础的值base，在发生竞争的情况下，会有一个Cell数组用于将不同线程的操作离散到不同的节点上去(会根据需要扩容，最大为CPU核数)，`sum()`会将所有Cell数组中的value和base累加作为返回值。核心的思想就是将AtomicLong一个value的更新压力分散到多个value中去，从而降低更新热点。
+
+LongAdder中有几个关键域：
+
+```java
+transient volatile Cell[] cells;//累加单元数组，懒惰初始化
+transient volatile long base;//基础值，如果是单线程没有竞争，则用cas累加这个域
+transient volatile int cellsBusy;//zaicell创建或扩容时，置位1，表示加锁
+```
+
+其中cells就是累加单元，用来给各个线程分配累加任务。
+
+base用来做单线程的累加，同时还有汇总的作用，也是就是说base=cells[0]+cells[1]……+base。
+
+cellsBusy则用来表示加锁置位，0表示无锁，1表示加锁。
+
+在Cell类源码中我们能看出，CELL底层也是采用CAS来做累加计数：
+
+```java
+@sun.misc.Contended static final class Cell {
+        volatile long value;
+        Cell(long x) { value = x; }
+        final boolean cas(long cmp, long val) {
+            return UNSAFE.compareAndSwapLong(this, valueOffset, cmp, val);
+        }
+ 
+        // Unsafe mechanics
+        private static final sun.misc.Unsafe UNSAFE;
+        private static final long valueOffset;
+        static {
+            try {
+                UNSAFE = sun.misc.Unsafe.getUnsafe();
+                Class<?> ak = Cell.class;
+                valueOffset = UNSAFE.objectFieldOffset
+                    (ak.getDeclaredField("value"));
+            } catch (Exception e) {
+                throw new Error(e);
+            }
+        }
+    }
+```
+
+可以看到Cell类用`Contended`注解修饰，这里主要是解决false sharing(伪共享的问题)，不过个人认为伪共享翻译的不是很好，或者应该是错误的共享，比如两个volatile变量被分配到了同一个缓存行，但是这两个的更新在高并发下会竞争，比如线程A去更新变量a，线程B去更新变量b，但是这两个变量被分配到了同一个缓存行，因此会造成每个线程都去争抢缓存行的所有权，例如A获取了所有权然后执行更新这时由于volatile的语义会造成其刷新到主存，但是由于变量b也被缓存到同一个缓存行，因此就会造成cache miss，这样就会造成极大的性能损失，因此有一些类库的作者，**例如JUC下面的、Disruptor等都利用了插入dummy 变量的方式，使得缓存行被其独占(填充)**，比如下面这种代码：
+
+```java
+static final class Cell {
+        volatile long p0, p1, p2, p3, p4, p5, p6;
+        volatile long value;
+        volatile long q0, q1, q2, q3, q4, q5, q6;
+        Cell(long x) { value = x; }
+
+        final boolean cas(long cmp, long val) {
+            return UNSAFE.compareAndSwapLong(this, valueOffset, cmp, val);
+        }
+
+        // Unsafe mechanics
+        private static final sun.misc.Unsafe UNSAFE;
+        private static final long valueOffset;
+        static {
+            try {
+                UNSAFE = getUnsafe();
+                Class<?> ak = Cell.class;
+                valueOffset = UNSAFE.objectFieldOffset
+                    (ak.getDeclaredField("value"));
+            } catch (Exception e) {
+                throw new Error(e);
+            }
+        }
+ }
+```
+
+在Java中，可以通过使用 `sun.misc.Contended` 注解（在Java 8及之后的版本中提供）来解决伪共享问题。这个注解可以在字段上使用，用于告诉虚拟机在分配内存时进行填充，以避免伪共享问题。**它的原理是在使用此注解的对象或字段的前后各增加128字节大小的 padding 从而让 CPU 将对象预读至缓存时占用不同的缓存行,这样,不会造成对方缓存行的失效。也就是说，增加无用的内存空间是cells扩容，从而在缓存中，每一个cell能占据一个缓存行，也就解决了失效的问题。**
+
+在 `LongAdder` 的实现中，每个单元（`Cell`）都是一个独立的计数器，它们被存储在连续的内存位置中。由于伪共享问题，如果多个单元被存储在同一个缓存行中，那么当多个线程同时修改不同的单元时，会导致缓存行的无效化，从而降低了性能。
+
+![img](https://cdn.jsdelivr.net/gh/amonstercat/PicGo@master/202403301645997.webp)
+
+为了解决这个问题，`LongAdder` 在设计时会对单元进行填充，确保它们被存储在不同的缓存行中，从而避免了伪共享问题。通过填充，每个单元都独占一个缓存行，避免了不必要的缓存行无效化，提高了并发性能。
+
+
+
+## 3、 实时打卡加入判断降级逻辑与考勤规则缓存
+
+
 
