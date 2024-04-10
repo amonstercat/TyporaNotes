@@ -1073,6 +1073,8 @@ class ConsistentHash {
     public static HashMap<String,Instance> map = new HashMap<>();//将服务实例与ip地址一一映射
     //预处理 形成哈希环
     static {
+        
+        ---------------------------------------------------------------------
         //程序初始化，将所有的服务器(真实节点与虚拟节点)放入Nodes（底层为红黑树）中
         for (Instance instance : instances) {
             String ip = instance.getIp();
@@ -1086,6 +1088,7 @@ class ConsistentHash {
                 Nodes.put(hash,ip); //环TreeMap上放入每个真实节点对应的虚拟节点
             }
         }
+        ---------------------------------------------------------------------
     }
     
     
@@ -1138,6 +1141,7 @@ class ConsistentHash {
 1、这里的`LoadBalancer` 接口的抽象方法内多增加了一个参数`Address`，这是因为我们**之前实现的轮询和随机算法与客户端的地址无关**，而我们**这里是同一个客户端在服务端没有发生变化的前提下都要打到同一台服务器上，这与客户端的地址有关**
 
 2、哈希环采用`TreeMap`红黑树来模拟实现，在`TreeMap`的`api`中有一个`tailMap`() 函数，输入一个`fromKey`，输出的是一个`SortedMap`有序Map，再使用`firstKey`()拿到最近(顺时针第一个)一个大于客户端请求对应哈希值的元素。
+
 3、用虚拟节点来防止某个节点的流量过大而导致的一些问题
 
 4、使用`Hashmap`将服务实例和`ip`地址对应，因为`getService`()得到的是`ip`地址，而我们最后需要返回的是`instance`，可以看到，每个真实节点和其对应的虚拟节点均对应着同一个`instance`
@@ -2125,6 +2129,304 @@ public class RpcClientProxy {
 
 
 
+### 雪花算法改进（增加最近本地时间戳缓存事件触发处理）
+
+
+
+先看看生成唯一性id的代码：
+
+```java
+package cn.fyupeng.idworker;
+
+import cn.fyupeng.factory.ThreadPoolFactory;
+import cn.fyupeng.idworker.exception.InvalidSystemClockException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.security.SecureRandom;
+import java.util.concurrent.*;
+
+public class IdWorker {
+    /**
+     * 自定义 分布式唯一号 id
+     *  1 位 符号位
+     * 41 位 时间戳
+     * 10 位 工作机器 id
+     * 12 位 并发序列号
+     *
+     *       The distribute unique id is as follows :
+     * +---------------++---------------+---------------+-----------------+
+     * |     Sign      |     epoch     |    workerId   |     sequence     |
+     * |    1 bits     |    41 bits    |    10 bits   |      12 bits      |
+     * +---------------++---------------+---------------+-----------------+
+     */
+
+    /**
+     * 服务器运行时 开始时间戳
+     */
+    protected long epoch = 1288834974657L;
+//    protected long epoch = 1387886498127L; // 2013-12-24 20:01:38.127
+    /**
+     * 机器 id 所占位数
+     */
+    protected long workerIdBits = 10L;
+    /**
+     * 最大机器 id
+     * 结果为 1023
+     */
+    protected long maxWorkerId = -1L ^ (-1L << workerIdBits);
+    /**
+     * 并发序列在 id 中占的位数
+     */
+    protected long sequenceBits = 12L;
+
+    /**
+     * 机器 id 掩码
+     */
+    protected long workerIdShift = sequenceBits;
+
+    /**
+     * 时间戳 掩码
+     */
+    protected long timestampLeftShift = sequenceBits + workerIdBits;
+    /**
+     * 并发序列掩码
+     * 二进制表示为 12 位 1 (ob111111111111=0xfff=4095)
+     * 也表示序列号最大数
+     */
+    protected long sequenceMask = -1L ^ (-1L << sequenceBits);
+
+    /**
+     * 上一次系统时间 时间戳
+     * 用于 判断系统 是否发生 时钟回拨 异常
+     */
+    protected long lastMillis = -1L;
+    /**
+     * 工作机器 ID (0-1023)
+     */
+    protected final long workerId;
+    /**
+     * 并发冲突序列 (0-4095)
+     * 即毫秒内并发量
+     */
+    protected long sequence = 0L;
+    /**
+     * 最近时间阈值
+     */
+    protected long thresholdMills = 500L;
+
+    /**
+     * 最近时间缓存时间戳大小阈值
+     */
+    protected long thresholdSize = 3000;
+
+    /**
+     * 时间戳 - 序列号 id
+     */
+    private ConcurrentHashMap<Long, Long> timeStampMaxSequenceMap = new ConcurrentHashMap<>();
+
+    /**
+     * 自定义 最近时间保存 时间戳 清理启用的线程池
+     */
+    private ExecutorService timeStampClearExecutorService = ThreadPoolFactory.createDefaultThreadPool("timestamp-clear-pool");
+
+
+    protected Logger logger = LoggerFactory.getLogger(IdWorker.class);
+
+    public IdWorker(long workerId) {
+        this.workerId = checkWorkerId(workerId);
+
+        logger.debug("worker starting. timestamp left shift {}, worker id {}", timestampLeftShift, workerId);
+    }
+
+    public long getEpoch() {
+        return epoch;
+    }
+
+    private long checkWorkerId(long workerId) {
+        // sanity check for workerId
+        if (workerId > maxWorkerId || workerId < 0) {
+            int rand = new SecureRandom().nextInt((int) maxWorkerId + 1);
+            logger.warn("worker Id can't be greater than {} or less than 0, use a random {}", maxWorkerId, rand);
+            return rand;
+        }
+
+        return workerId;
+    }
+
+    public synchronized long nextId() {
+        long timestamp = millisGen();
+        // 解决时钟回拨问题（低并发场景）
+        if (timestamp < lastMillis) {
+            // 可以去 获取 之前该 时间戳 最大的序列号
+            // 并发还没有到最大值，可以对序列号递增
+            /**
+             * 当前回拨后 没有之前 时间戳生成 id，且可阻塞时间不超过 500 ms
+             * 1、保证最坏情况 不阻塞超过 500ms
+             * 2、否则 抛出异常，不再阻塞，因为超时该时间大概率会导致超时
+             */
+            Long clockBackMaxSequence;
+            long diff = lastMillis - timestamp;
+
+            if (diff > 1000L) {
+                logger.warn("clock is moving backwards more then 1000ms");
+                logger.error("clock is moving backwards.  Rejecting requests until {}.", lastMillis);
+                throw new InvalidSystemClockException(String.format(
+                        "Clock moved backwards.  Refusing to generate id for {} milliseconds", lastMillis - timestamp));
+            } else if (diff > 500L) {
+                logger.warn("clock is moving backwards more than 500ms");
+                long blockMillis = lastMillis - 500L;
+                // 阻塞到 500 ms 内，因为 500ms内 保留能获取到最大序列号的 时间戳
+                timestamp = tilNextMillis(blockMillis);
+                clockBackMaxSequence = timeStampMaxSequenceMap.get(timestamp);
+
+                if (clockBackMaxSequence != null && clockBackMaxSequence < sequenceMask) {
+                    sequence = clockBackMaxSequence + 1;
+                    // 继续维护 该时间戳的最大 序列号
+                    timeStampMaxSequenceMap.put(timestamp, sequence);
+                } else {
+                    logger.error("clock is moving backwards.  Rejecting requests until {}.", lastMillis);
+                    throw new InvalidSystemClockException(String.format(
+                            "Clock moved backwards.  Refusing to generate id for {} milliseconds", lastMillis - timestamp));
+                }
+                // 恢复 发生时钟回拨的 状态
+            } else {
+                logger.info("clock is moving backwards less than 500ms");
+                clockBackMaxSequence = timeStampMaxSequenceMap.get(timestamp);
+
+                if (clockBackMaxSequence != null && clockBackMaxSequence < sequenceMask) {
+                    sequence = clockBackMaxSequence + 1;
+                    // 继续维护 该时间戳的最大 序列号
+                    timeStampMaxSequenceMap.put(timestamp, sequence);
+                    // 时间回拨 小于 500ms，恢复回拨前时间戳 + 1ms，序列号 id
+                } else {
+                    timestamp = tilNextMillis(lastMillis);
+                    sequence = 0;
+                }
+            }
+
+        }
+        // 毫秒并发
+        if (lastMillis == timestamp) {
+            sequence = (sequence + 1) & sequenceMask;
+            // 序列号已经最大了，需要阻塞新的时间戳
+            // 表示这一毫秒并发量已达上限，新的请求会阻塞到新的时间戳中去
+            if (sequence == 0)
+                timestamp = tilNextMillis(lastMillis);
+        } else {
+            sequence = 0;
+        }
+
+        /**
+         * 由于 时间戳 跟 序列号 都是递增，所以序列号总会保持最大值
+         */
+        timeStampMaxSequenceMap.put(timestamp, sequence);
+        // 当并发严重致保存时间戳超过阈值时，考虑垃圾清理
+        if (timeStampMaxSequenceMap.size() > thresholdSize){
+            timeStampClearExecutorService.execute(() -> {
+                // 遍历清除 timeStamp 比 最近时间阈值 更前的时间戳
+                timeStampMaxSequenceMap.keySet().stream().forEach(entryTimeStamp -> {
+                    if (lastMillis - entryTimeStamp > thresholdMills) {
+                        timeStampMaxSequenceMap.remove(entryTimeStamp);
+                    }
+                });
+            });
+        }
+        if (timestamp > lastMillis) {
+            // 保存 上一次时间戳
+            lastMillis = timestamp;
+        }
+
+        long diff = timestamp - getEpoch();
+        return (diff << timestampLeftShift) |
+                (workerId << workerIdShift) |
+                sequence;
+    }
+
+    /**
+     * 阻塞生成下一个更大的时间戳
+     * @param lastMillis
+     * @return
+     */
+    protected long tilNextMillis(long lastMillis) {
+        long millis = millisGen();
+        while (millis <= lastMillis)
+            millis = millisGen();
+
+        return millis;
+    }
+
+    protected long millisGen() {
+        return System.currentTimeMillis();
+    }
+
+    public long getLastMillis() {
+        return lastMillis;
+    }
+
+    public long getWorkerId() {
+        return workerId;
+    }
+}
+
+```
+
+在代码中，针对时钟回拨问题，采取了以下措施：
+
+1. **时钟回拨超过1000ms**：如果检测到时钟回拨超过1000ms，则会记录警告日志，并抛出异常。此时，拒绝生成ID，直到系统时间恢复正常。
+2. **时钟回拨在500ms到1000ms之间**：如果时钟回拨在这个范围内，则会将当前时间戳调整到500ms以前，并尝试获取该时间戳之前保存的最大序列号。如果存在最大序列号且未达到最大值，则将序列号加1，并继续生成ID。否则，也会抛出异常。
+3. **时钟回拨小于500ms**：如果时钟回拨小于500ms，则会尝试获取该时间戳之前保存的最大序列号。如果存在最大序列号且未达到最大值，则将序列号加1，并继续生成ID。否则，会将时间戳调整到上一个时间戳的下一毫秒，并清零序列号，以确保生成的ID是严格递增的。
+4. **并发情况下的序列号处理**：在同一毫秒内的并发情况下，会通过递增序列号来保证生成的ID唯一性。如果当前序列号已经达到最大值，则会阻塞直到下一毫秒，并重新开始序列号。
+
+
+
+最近缓存时间戳的处理在代码中体现为 `timeStampMaxSequenceMap` 这个 `ConcurrentHashMap`，它的作用是记录每个时间戳对应的最大序列号。这个缓存的维护能够确保在并发情况下，每个时间戳对应的最大序列号是准确的。
+
+在处理时钟回拨时，我们需要根据之前保存的时间戳和序列号信息，以及最新的系统时间来生成 ID。如果发生时钟回拨，我们会通过调整当前时间戳来确保生成的 ID 是递增的。同时，我们还需要考虑并发情况下的序列号，确保生成的 ID 不会重复或逆序。每次生成一个新的 ID 时，都会将当前时间戳与其对应的最大序列号记录在这个 map 中。
+
+这个 map 的键是时间戳，值是该时间戳对应的最大序列号。在处理时钟回拨时，会根据这个 map 中保存的信息来确保生成的 ID 是递增的。因此，每个时间戳都会保存到 `timeStampMaxSequenceMap` 中，并且随着时间的推移，这个 map 中会包含越来越多的时间戳及其对应的最大序列号。
+
+
+
+其实回答的时候只需要关注回拨时间小于500ms下的情况就行：
+
+如果时钟回拨小于或等于500ms，首先尝试获取调整后时间戳（当前时间戳）对应的最大序列号。如果存在最大序列号且未达到最大值，则将序列号加1，并继续维护时间戳的最大序列号。这是因为在这种情况下，即使发生了时钟回拨，我们仍然可以保留之前的时间戳，并在此基础上继续生成递增的ID。
+
+但如果不存在最大序列号，或者最大序列号已经达到了最大值，那么就需要将时间戳调整到上一个时间戳的下一毫秒，并清零序列号。这是为了确保生成的ID是递增的，避免因为时钟回拨导致的重复或者逆序。
+
+
+
+
+
+这段代码用于处理时钟回拨小于500ms的情况。让我逐步解释：
+
+1. `logger.info("clock is moving backwards less than 500ms");`：
+   - 这是一个日志记录语句，表示系统时间回拨的情况在500ms以内。这个信息被记录下来，以便后续的调试和分析。
+2. `clockBackMaxSequence = timeStampMaxSequenceMap.get(timestamp);`：
+   - 这一行代码尝试从 `timeStampMaxSequenceMap` 中获取当前时间戳对应的最大序列号。这是为了检查在发生时钟回拨前，是否已经有其他线程在相同的时间戳上生成了ID，并且记录了对应的最大序列号。
+3. `if (clockBackMaxSequence != null && clockBackMaxSequence < sequenceMask) {`：
+   - 这是一个条件判断语句，用于检查是否存在最大序列号，并且该序列号未达到最大值。如果条件成立，说明在发生时钟回拨前，已经有其他线程在相同的时间戳上生成了ID，并且记录了对应的最大序列号。
+   - 如果条件成立，就将当前序列号设置为之前的最大序列号加1，并将这个新的序列号更新到 `timeStampMaxSequenceMap` 中，以便后续的ID生成。
+4. `sequence = clockBackMaxSequence + 1;`：
+   - 如果条件成立，将当前序列号设置为之前的最大序列号加1，以确保生成的ID是递增的。
+5. `timeStampMaxSequenceMap.put(timestamp, sequence);`：
+   - 如果条件成立，更新 `timeStampMaxSequenceMap` 中当前时间戳对应的最大序列号为新计算出的序列号。
+6. `timestamp = tilNextMillis(lastMillis);`：
+   - 如果条件不成立，即不存在最大序列号或最大序列号已达到最大值，就需要调整当前时间戳到上一个时间戳的下一毫秒。
+   - 这是为了确保生成的ID是递增的，避免因为时钟回拨导致的重复或逆序。这个方法将会阻塞，直到系统时间超过上一个时间戳，然后返回一个比上一个时间戳大的时间戳。
+7. `sequence = 0;`：
+   - 在调整时间戳后，将序列号清零，以确保生成的ID从0开始递增。
+
+
+
+**假设当前系统时间为 10:00:00.500，而在某个时刻发生了时钟回拨，系统时间突然被调整为 10:00:00.200。这意味着系统时间向前回拨了300毫秒。**
+
+**在这种情况下，我们需要调整当前时间戳到上一个时间戳的下一毫秒，以确保生成的ID是递增的，并且避免重复或者逆序的情况。因此，我们会使用 `tilNextMillis` 方法等待系统时间超过上一个时间戳，并将当前时间戳调整到下一毫秒，即10:00:00.501。**
+
+**同时，我们会将序列号重置为0，这是因为我们从新的时间戳开始计数，并且确保生成的ID是从0开始递增的。这样，在新的时间戳上生成的第一个ID将是0，然后逐渐递增。**
+
+**在处理时钟回拨的情况下，`lastMillis` 应该被更新为调整后的时间戳，以确保后续生成的 ID 是基于正确的时间戳生成的。因此，`lastMillis` 应该被更新为 `timestamp`，而不是保持原来的值。这个问题可能是作者疏忽导致的。在这种情况下，可以将 `lastMillis` 更新为 `timestamp`，以确保算法正确处理时钟回拨的情况。感谢您的指出，这对于确保代码正确性非常重要。**
+
 
 
 ### 如何解决请求幂等性问题？
@@ -2909,13 +3211,59 @@ https://developer.aliyun.com/article/1058265
 
 
 
+### SPI机制在项目中的应用
 
+通过 SPI（Service Provider Interface）机制，可以实现服务的自动注册和发现。SPI 是一种约定，提供了一种服务发现的机制，允许服务提供者（Provider）通过在类路径下的配置文件中注册自己的服务提供者实现，然后由服务消费者（Consumer）来动态地发现和调用。具体来说，如果你想支持多个注册中心（如Nacos、Zookeeper、Eureka），可以按照以下步骤来使用SPI机制实现：
 
+定义服务提供者接口：首先，定义一个接口，表示服务提供者的行为，比如注册服务、发现服务等：
 
+```java
+public interface ServiceRegistry {
+    void registerService(String serviceName, String serviceAddress);
+    String discoverService(String serviceName);
+}
 
+```
 
+创建服务提供者实现类：针对不同的注册中心，创建不同的实现类来实现 `ServiceRegistry` 接口：
 
+```java
+public class NacosServiceRegistry implements ServiceRegistry {
+    // 实现 Nacos 注册中心的注册和发现逻辑
+}
 
+public class ZookeeperServiceRegistry implements ServiceRegistry {
+    // 实现 Zookeeper 注册中心的注册和发现逻辑
+}
+
+public class EurekaServiceRegistry implements ServiceRegistry {
+    // 实现 Eureka 注册中心的注册和发现逻辑
+}
+
+```
+
+在`META-INF/services/`目录下创建接口的配置文件：在类路径下创建一个名为 `META-INF/services/` 的目录，在该目录下创建一个以接口全限定名为名称的文件，文件的内容为实现类的全限定名，这样就告诉了Java虚拟机当前服务接口的具体实现类。
+
+```
+// META-INF/services/cn.fyupeng.registry.ServiceRegistry
+cn.fyupeng.registry.NacosServiceRegistry
+cn.fyupeng.registry.ZookeeperServiceRegistry
+cn.fyupeng.registry.EurekaServiceRegistry
+```
+
+使用服务：在需要使用注册中心的地方，通过Java的SPI机制动态加载注册中心的实现类，并调用其方法。
+
+```java
+public class SomeClass {
+    public void useService() {
+        ServiceLoader<ServiceRegistry> serviceLoader = ServiceLoader.load(ServiceRegistry.class);
+        for (ServiceRegistry registry : serviceLoader) {
+            // 使用注册中心的方法
+            registry.registerService("serviceName", "serviceAddress");
+        }
+    }
+}
+```
 
 
 
@@ -5369,7 +5717,7 @@ private void scheduleExpirationRenewal(long threadId) {
 
 ```
 
-通过`tryLockInnerAsync`的源码不难分析`Redisson`锁的存储结构，`Redisson`锁采用的是`hash`结构，`Redis` 的`Key`为锁名，也就是初始化时传入的`name`参数，**`hash`的`key`为锁的id属性(uuid)+线程id**，`hash`的`value`为加锁次数，不难看出`Redisson`分布式锁是可重入的。
+通过`tryLockInnerAsync`的源码不难分析`Redisson`锁的存储结构，`Redisson`锁采用的是`hash`结构，`Redis` 的`Key`为锁名，也就是初始化时传入的`name`参数，**`hash`的`field`为锁的id属性(uuid)+线程id**，`hash`的`value`为加锁次数，不难看出`Redisson`分布式锁是可重入的。
 
 这段 Lua 脚本是用于在 Redis 中执行的，主要用于实现 Redisson 分布式锁的尝试获取操作。让我逐步解释每个参数的含义：
 
@@ -6095,7 +6443,156 @@ static final class Cell {
 
 
 
-先看看考勤规则缓存这一部分，因为这里涉及到了Redis缓存队列
+先看看考勤规则缓存这一部分，因为这里涉及到了Redis缓存队列：
+
+![image-20240402000239189](https://cdn.jsdelivr.net/gh/amonstercat/PicGo@master/202404020002310.png)
 
 
 
+可以看出在未设置缓存之前，直接通过数据库来查询该租户下的员工出勤规则列表：
+
+```java
+    public List<EmployeeAttendanceRuleDetailDto> employeeAttendanceRuleInfoList(EmployeeAttendanceRuleParamDto param, Long entId, Long buId) {
+        if (CollectionUtils.isEmpty(param.getEmployeeIds())
+                || null == param.getStartDate() || null == param.getEndDate()
+                || null == entId || null == buId) {
+            return Collections.emptyList();
+        }
+        if(param.getStartDate().after(param.getEndDate())){
+            log.info("开始日期不能晚于结束日期 param ={}", JacksonUtils.toJson(param));
+            throw new CustomException(ErrorCodeEnum.SYS_INVALID_PARAMS);
+        }
+
+        //只保留日期，防止传了分钟查询不到相关数据
+        Date start = LocalDate.fromDateFields(param.getStartDate()).toDate();
+        Date end = LocalDate.fromDateFields(param.getEndDate()).toDate();
+
+        // 查询员工与出勤规则对应关系
+        List<RuleEmployeeMappingDto> ruleEmployeeList = employeeRuleService.getRuleEmployeeList(param.getEmployeeIds(), null, start, end, entId, buId);
+        return employeeAttendanceRuleInfoList(ruleEmployeeList,start,end,param.getAttrType(),entId,buId);
+    }
+```
+
+而加入缓存之后，判断考勤规则数据是否命中、以及是否需要加入缓存：
+
+![image-20231204172714517](https://cdn.jsdelivr.net/gh/amonstercat/PicGo/202312041727855.png)
+
+着重来看一下缓存相关逻辑：
+
+1、从缓存中查询规则信息：
+
+```java
+/**
+ * 从缓存中查询规则信息
+ * @param start
+ * @param end
+ * @param employeeIds
+ * @param entId
+ * @return null 表示缓存中没有数据，或者缓存中数据已是过期数据，需要重新从db查询
+ *         如果返回结果不为空，即使是个空数组，也不用从db查询（为空数组说明这几天确实就是没有配置考勤规则）
+ */
+private List<EmployeeAttendanceRuleDetailDto> queryRuleFromCache(LocalDate start,LocalDate end,int attrType,List<Long> employeeIds,Long entId){
+    //构造缓存key
+    List<String> keys = new ArrayList<>();
+    List<LocalDate> dateList = this.getDates(start,end);
+    dateList.forEach(date -> {
+        employeeIds.forEach(employeeId -> {
+            String key = getDetailCacheKey(entId,employeeId,date);
+            keys.add(key);
+        });
+    });
+
+    //批量查询结果
+    List<String> resStrs = redisTemplate.opsForValue().multiGet(keys);
+    if(CollectionUtils.isEmpty(resStrs)){
+        //缓存中如果没有数据，返回空，触发从库中查询
+        return null;
+    }
+    resStrs = resStrs.stream().filter(e -> Objects.nonNull(e)).collect(Collectors.toList());
+    if(resStrs.size()!=keys.size()){
+        //数据条数和请求的条数对不上，说明没有缓存或缓存已过期了，返回空，触发从库中查询
+        return null;
+    }
+
+    List<EmployeeAttendanceRuleDetailDto> ruleDtailList = new ArrayList<>();
+    for(String resStr:resStrs){
+        //当天有考勤规则才转成对像
+        if(!NONE_RULE.equals(resStr)){
+            EmployeeAttendanceRuleDetailDto detailDto = JacksonUtils.fromJson(resStr,EmployeeAttendanceRuleDetailDto.class);
+            ruleDtailList.add(dealRuleDetailDto(detailDto,attrType));
+        }
+    }
+    log.info("从缓存中查询考勤规则详情,employeeIds:{},start:{},end:{}",employeeIds,DateUtils.format(start.toDate(),DatePattern.YMD),DateUtils.format(end.toDate(),DatePattern.YMD));
+    return ruleDtailList;
+}
+```
+
+2、将员工加入到缓存队列
+
+```java
+        param.getEmployeeIds().forEach(employeeId -> {
+            AddCacheMsg msg = AddCacheMsg.builder().employeeId(employeeId).entId(entId).buId(buId).build();
+            boolean res = redisListTool.sendMsgToList(CacheConstants.getAddCacheQueueName(),JacksonUtils.toJson(msg),String.valueOf(employeeId));
+            if(!res){
+                log.warn("员工加缓存失败:{}",employeeId);
+            }
+        });
+
+
+
+
+
+   public boolean sendMsgToList(String name, String msg, String key) {
+    if (!StringUtils.isEmpty(name) && !StringUtils.isEmpty(key) && !StringUtils.isEmpty(msg)) {
+        // 检查消息是否已存在于Redis中
+        Boolean existed = this.redisTemplate.opsForSet().isMember("hcm:absence:queue:" + name + "_unique", key);
+        if (existed != null && existed) {
+            log.warn("消息已在Redis中存在，不发送");
+            CountStatisticUtil.increment("msgExisted");
+            return false;
+        } else {
+            // 将消息推送到Redis队列
+            Long res = this.redisTemplate.opsForList().leftPush("hcm:absence:queue:" + name, JSONObject.toJSONString(new RedisQueueMsg(key, msg)));
+            if (res != null && res > 0L) {
+                // 将消息的唯一标识加入Redis集合
+                this.redisTemplate.opsForSet().add("hcm:absence:queue:" + name + "_unique", new String[]{key});
+                // 发送通知，通知消费者有新消息
+                this.redisTemplate.convertAndSend(this.config.getNoticeChannel(), name);
+                CountStatisticUtil.increment("sendSuccess");
+                return true;
+            } else {
+                return false;
+            }
+        }
+    } else {
+        CountStatisticUtil.increment("emptyMsg");
+        return false;
+    }
+}
+```
+
+>  为什么这里要用redis中的List队列，而不是其他的数据结构呢？
+
+
+
+
+
+
+
+
+
+
+
+## 4、单个租户的核算时进行分批消费，每次发送至MQ（50个人）并行消费
+
+
+
+
+
+## 5、在日报核算后触发月报核算时按照同一月报分组进行批量核算
+
+
+
+
+
+## 6、避免ContextBuilder内部的RPC调用，同时异步查询假期账户余额，与查询其他数据并行进行
